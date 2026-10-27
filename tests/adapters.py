@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import math
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
 import torch
+import torch.nn.functional as F
+import regex
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
@@ -29,7 +32,8 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    # Contract every leading input position with the input dimension; retain output dimension.
+    return torch.einsum("...d,od->...o", in_features, weights)
 
 
 def run_embedding(
@@ -51,7 +55,7 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    return weights[token_ids]
 
 
 def run_swiglu(
@@ -83,7 +87,7 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    return F.linear(F.silu(F.linear(in_features, w1_weight)) * F.linear(in_features, w3_weight), w2_weight)
 
 
 def run_scaled_dot_product_attention(
@@ -104,7 +108,13 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    scale = Q.shape[-1] ** -0.5
+    # Contract feature dimension d, producing one score for every query/key pair.
+    scores = torch.einsum("...qd,...kd->...qk", Q, K) * scale
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float("-inf"))
+    # Contract attention probabilities over keys against value vectors.
+    return torch.einsum("...qk,...kd->...qd", F.softmax(scores, dim=-1), V)
 
 
 def run_multihead_self_attention(
@@ -138,7 +148,13 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    head_dim = d_model // num_heads
+    q = F.linear(in_features, q_proj_weight).reshape(*in_features.shape[:-1], num_heads, head_dim).transpose(-3, -2)
+    k = F.linear(in_features, k_proj_weight).reshape(*in_features.shape[:-1], num_heads, head_dim).transpose(-3, -2)
+    v = F.linear(in_features, v_proj_weight).reshape(*in_features.shape[:-1], num_heads, head_dim).transpose(-3, -2)
+    causal = torch.tril(torch.ones(in_features.shape[-2], in_features.shape[-2], dtype=torch.bool, device=in_features.device))
+    out = run_scaled_dot_product_attention(q, k, v, causal).transpose(-3, -2).reshape(*in_features.shape[:-1], d_model)
+    return F.linear(out, o_proj_weight)
 
 
 def run_multihead_self_attention_with_rope(
@@ -178,7 +194,18 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    head_dim = d_model // num_heads
+    positions = torch.arange(in_features.shape[-2], device=in_features.device) if token_positions is None else token_positions
+    # RoPE positions have no head axis; insert one so each example's positions broadcast across its heads.
+    positions = positions.unsqueeze(-2)
+    q = F.linear(in_features, q_proj_weight).reshape(*in_features.shape[:-1], num_heads, head_dim).transpose(-3, -2)
+    k = F.linear(in_features, k_proj_weight).reshape(*in_features.shape[:-1], num_heads, head_dim).transpose(-3, -2)
+    v = F.linear(in_features, v_proj_weight).reshape(*in_features.shape[:-1], num_heads, head_dim).transpose(-3, -2)
+    q = run_rope(head_dim, theta, max_seq_len, q, positions)
+    k = run_rope(head_dim, theta, max_seq_len, k, positions)
+    causal = torch.tril(torch.ones(in_features.shape[-2], in_features.shape[-2], dtype=torch.bool, device=in_features.device))
+    out = run_scaled_dot_product_attention(q, k, v, causal).transpose(-3, -2).reshape(*in_features.shape[:-1], d_model)
+    return F.linear(out, o_proj_weight)
 
 
 def run_rope(
@@ -200,7 +227,17 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    if d_k % 2:
+        raise ValueError("RoPE dimension must be even")
+    positions = token_positions.to(in_query_or_key.device)
+    inv_freq = theta ** (-torch.arange(0, d_k, 2, device=in_query_or_key.device, dtype=torch.float32) / d_k)
+    angles = positions[..., :, None].float() * inv_freq
+    cos, sin = angles.cos(), angles.sin()
+    x_even, x_odd = in_query_or_key[..., 0::2], in_query_or_key[..., 1::2]
+    out = torch.empty_like(in_query_or_key)
+    out[..., 0::2] = x_even * cos - x_odd * sin
+    out[..., 1::2] = x_even * sin + x_odd * cos
+    return out
 
 
 def run_transformer_block(
@@ -273,7 +310,15 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    x = in_features
+    x = x + run_multihead_self_attention_with_rope(
+        d_model, num_heads, max_seq_len, theta,
+        weights["attn.q_proj.weight"], weights["attn.k_proj.weight"],
+        weights["attn.v_proj.weight"], weights["attn.output_proj.weight"],
+        run_rmsnorm(d_model, 1e-5, weights["ln1.weight"], x),
+    )
+    x = x + run_swiglu(d_model, d_ff, weights["ffn.w1.weight"], weights["ffn.w2.weight"], weights["ffn.w3.weight"], run_rmsnorm(d_model, 1e-5, weights["ln2.weight"], x))
+    return x
 
 
 def run_transformer_lm(
@@ -355,7 +400,13 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    x = run_embedding(vocab_size, d_model, weights["token_embeddings.weight"], in_indices)
+    for layer in range(num_layers):
+        prefix = f"layers.{layer}."
+        block_weights = {k[len(prefix):]: v for k, v in weights.items() if k.startswith(prefix)}
+        x = run_transformer_block(d_model, num_heads, d_ff, context_length, rope_theta, block_weights, x)
+    x = run_rmsnorm(d_model, 1e-5, weights["ln_final.weight"], x)
+    return F.linear(x, weights["lm_head.weight"])
 
 
 def run_rmsnorm(
@@ -378,7 +429,9 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    x_float = in_features.float()
+    normalized = x_float * torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + eps)
+    return (normalized * weights.float()).to(in_features.dtype)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -392,7 +445,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return F.silu(in_features)
 
 
 def run_get_batch(
@@ -415,7 +468,10 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    starts = torch.randint(0, len(dataset) - context_length, (batch_size,))
+    x = torch.stack([torch.from_numpy(dataset[i : i + context_length].copy()) for i in starts])
+    y = torch.stack([torch.from_numpy(dataset[i + 1 : i + context_length + 1].copy()) for i in starts])
+    return x.to(device=device, dtype=torch.long), y.to(device=device, dtype=torch.long)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -431,7 +487,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return F.softmax(in_features, dim=dim)
 
 
 def run_cross_entropy(
@@ -449,7 +505,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return F.cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -461,14 +517,43 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    torch.nn.utils.clip_grad_norm_(list(parameters), max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    class AdamW(torch.optim.Optimizer):
+        def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+            if lr < 0 or eps < 0 or not 0 <= betas[0] < 1 or not 0 <= betas[1] < 1:
+                raise ValueError("invalid AdamW hyperparameters")
+            super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+        @torch.no_grad()
+        def step(self, closure=None):
+            # Optimizer updates stay gradient-free, but closures must be able to build graphs and call backward.
+            with torch.enable_grad():
+                loss = closure() if closure is not None else None
+            for group in self.param_groups:
+                beta1, beta2 = group["betas"]
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if not state:
+                        state["step"] = 0
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                    state["step"] += 1
+                    grad = p.grad
+                    exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    step_size = group["lr"] * math.sqrt(1 - beta2 ** state["step"]) / (1 - beta1 ** state["step"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.addcdiv_(exp_avg, exp_avg_sq.sqrt().add_(group["eps"]), value=-step_size)
+            return loss
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -496,7 +581,12 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    if it < warmup_iters:
+        return max_learning_rate * it / warmup_iters
+    if it >= cosine_cycle_iters:
+        return min_learning_rate
+    progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+    return min_learning_rate + 0.5 * (1 + math.cos(math.pi * progress)) * (max_learning_rate - min_learning_rate)
 
 
 def run_save_checkpoint(
@@ -515,7 +605,7 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "iteration": iteration}, out)
 
 
 def run_load_checkpoint(
@@ -536,7 +626,10 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    checkpoint = torch.load(src, map_location="cpu")
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    return checkpoint["iteration"]
 
 
 def get_tokenizer(
@@ -559,7 +652,52 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    class Tokenizer:
+        def __init__(self):
+            self.vocab = vocab
+            self.ids = {token: idx for idx, token in vocab.items()}
+            self.ranks = {pair: i for i, pair in enumerate(merges)}
+            self.special = sorted(special_tokens or [], key=len, reverse=True)
+            self.special_ids = {s.encode(): self.ids[s.encode()] for s in self.special}
+            self.pattern = regex.compile(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
+
+        def _merge(self, pieces):
+            while len(pieces) > 1:
+                choices = [(self.ranks[pair], i, pair) for i, pair in enumerate(zip(pieces, pieces[1:])) if pair in self.ranks]
+                if not choices:
+                    break
+                _, i, pair = min(choices)
+                pieces[i:i + 2] = [pair[0] + pair[1]]
+            return pieces
+
+        def encode(self, text):
+            if not text:
+                return []
+            if self.special:
+                split = regex.split("(" + "|".join(regex.escape(s) for s in self.special) + ")", text)
+            else:
+                split = [text]
+            output = []
+            for part in split:
+                if not part:
+                    continue
+                if part.encode("utf-8") in self.special_ids:
+                    output.append(self.special_ids[part.encode("utf-8")])
+                    continue
+                for chunk in self.pattern.findall(part):
+                    pieces = [bytes([b]) for b in chunk.encode("utf-8")]
+                    output.extend(self.ids[p] for p in self._merge(pieces))
+            return output
+
+        def encode_iterable(self, iterable):
+            # Encode one input chunk at a time, keeping memory independent of corpus size.
+            for text in iterable:
+                yield from self.encode(text)
+
+        def decode(self, ids):
+            return b"".join(self.vocab[i] for i in ids).decode("utf-8", errors="replace")
+
+    return Tokenizer()
 
 
 def run_train_bpe(
@@ -589,4 +727,47 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    with open(input_path, encoding="utf-8") as f:
+        text = f.read()
+    specials = sorted(special_tokens, key=len, reverse=True)
+    chunks = regex.split("(?:" + "|".join(regex.escape(s) for s in specials) + ")", text) if specials else [text]
+    pattern = regex.compile(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
+    counts = {}
+    for chunk in chunks:
+        for word in pattern.findall(chunk):
+            key = tuple(bytes([b]) for b in word.encode("utf-8"))
+            counts[key] = counts.get(key, 0) + 1
+    vocab = {i: s.encode("utf-8") for i, s in enumerate(special_tokens)}
+    next_id = len(vocab)
+    for b in range(256):
+        token = bytes([b])
+        if token not in vocab.values():
+            vocab[next_id] = token
+            next_id += 1
+    merges = []
+    while next_id < vocab_size:
+        pair_counts = {}
+        for word, count in counts.items():
+            for pair in zip(word, word[1:]):
+                pair_counts[pair] = pair_counts.get(pair, 0) + count
+        if not pair_counts:
+            break
+        best = max(pair_counts, key=lambda p: (pair_counts[p], p))
+        merged = best[0] + best[1]
+        merges.append(best)
+        vocab[next_id] = merged
+        next_id += 1
+        updated = {}
+        for word, count in counts.items():
+            new_word = []
+            i = 0
+            while i < len(word):
+                if i + 1 < len(word) and word[i] == best[0] and word[i + 1] == best[1]:
+                    new_word.append(merged)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            updated[tuple(new_word)] = count
+        counts = updated
+    return vocab, merges

@@ -49,6 +49,22 @@ def test_adamw(numpy_snapshot):
     )
 
 
+def test_adamw_closure_runs_with_gradients_enabled():
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = get_adamw_cls()([parameter], lr=0.1)
+
+    def closure():
+        optimizer.zero_grad()
+        loss = (parameter - 3).square().sum()
+        loss.backward()
+        return loss
+
+    loss = optimizer.step(closure)
+    assert loss.requires_grad
+    assert parameter.grad is not None
+    assert parameter.item() > 1.0
+
+
 def test_get_lr_cosine_schedule():
     max_learning_rate = 1
     min_learning_rate = 1 * 0.1

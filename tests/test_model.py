@@ -114,6 +114,27 @@ def test_multihead_self_attention_with_rope(
     numpy_snapshot.assert_match(actual_output, atol=1e-5)
 
 
+def test_multihead_self_attention_with_rope_batched_positions():
+    torch.manual_seed(7)
+    batch_size, sequence_length, d_model, num_heads = 3, 4, 8, 2
+    in_features = torch.randn(batch_size, sequence_length, d_model)
+    weights = [torch.randn(d_model, d_model) for _ in range(4)]
+    positions = torch.tensor([[0, 1, 2, 3], [5, 6, 7, 8], [2, 4, 6, 8]])
+
+    batched = run_multihead_self_attention_with_rope(
+        d_model, num_heads, 16, 10_000.0, *weights, in_features, positions
+    )
+    per_example = torch.cat(
+        [
+            run_multihead_self_attention_with_rope(
+                d_model, num_heads, 16, 10_000.0, *weights, in_features[i : i + 1], positions[i : i + 1]
+            )
+            for i in range(batch_size)
+        ]
+    )
+    torch.testing.assert_close(batched, per_example)
+
+
 def test_transformer_lm(
     numpy_snapshot, vocab_size, n_keys, d_model, n_layers, n_heads, d_ff, theta, ts_state_dict, in_indices
 ):
@@ -181,6 +202,21 @@ def test_rmsnorm(numpy_snapshot, ts_state_dict, in_embeddings):
     actual_output = run_rmsnorm(d_model=d_model, eps=1e-5, weights=reference_weights, in_features=in_embeddings)
 
     numpy_snapshot.assert_match(actual_output, atol=1e-4)
+
+
+def test_rmsnorm_preserves_low_precision_dtype():
+    torch.manual_seed(8)
+    for dtype in (torch.float16, torch.bfloat16):
+        inputs = torch.randn(2, 3, 8, dtype=dtype)
+        weights = torch.randn(8, dtype=dtype)
+        actual = run_rmsnorm(8, 1e-5, weights, inputs)
+        expected = (
+            inputs.float()
+            * torch.rsqrt(inputs.float().square().mean(dim=-1, keepdim=True) + 1e-5)
+            * weights.float()
+        ).to(dtype)
+        assert actual.dtype == dtype
+        torch.testing.assert_close(actual, expected)
 
 
 def test_rope(numpy_snapshot, in_embeddings, d_model, theta, n_queries, pos_ids):
